@@ -1,14 +1,3 @@
-"""
-Pulls plain text out of a submitted file so the AI grader can read it,
-regardless of what format the student uploaded — source code, plain text,
-PDF, DOCX, or a ZIP of a small project.
-
-This is intentionally conservative about size: AI grading sends the
-extracted text straight into a prompt, so an unbounded extraction here
-becomes a cost/abuse vector (e.g. a student zipping up a huge dataset
-alongside their code). Every path below enforces a character cap.
-"""
-
 import io
 import zipfile
 from typing import Optional

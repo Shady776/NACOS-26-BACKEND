@@ -173,6 +173,7 @@ class Assignment(Base):
     description = Column(Text, nullable=True)
     max_score   = Column(Float, default=100.0, nullable=False)
     due_date    = Column(UTCDateTime, nullable=True)
+    grading_criteria = Column(Text, nullable=True)  # saved so the teacher does not retype it
     created_at  = Column(UTCDateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     is_active   = Column(Boolean, default=True, nullable=False)
 

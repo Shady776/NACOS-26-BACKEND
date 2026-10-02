@@ -107,6 +107,8 @@ ADMIN_FULLNAME=System Administrator
 # AI grading (OpenRouter)
 OPENROUTER_API_KEY=your-openrouter-key
 OPENROUTER_MODEL=openai/gpt-oss-120b
+# Optional: a second model that can read images and scanned PDFs (see "Optional variables")
+# OPENROUTER_VISION_MODEL=
 
 # File uploads (Cloudinary)
 CLOUDINARY_CLOUD_NAME=your-cloud-name
@@ -126,8 +128,8 @@ Where each value comes from:
 | `ADMIN_EMAIL`, `ADMIN_FULLNAME` | Admin details. The full name appears in the sidebar. |
 | `ADMIN_PASSWORD` | Admin password. |
 | `OPENROUTER_API_KEY` | Create an account at https://openrouter.ai and make a key under **Keys**. |
-| `OPENROUTER_MODEL` | A model ID copied from https://openrouter.ai/models, for example `openai/gpt-oss-120b`. Models ending in `:free` come and go: if grading fails with a 404 "model is unavailable", pick another model or use the paid version of the same one (it needs credit on your OpenRouter account). Restart the server after changing it. |
-| `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` | Create an account at https://cloudinary.com. All three are on the **Dashboard** (Product Environment Credentials). |
+| `OPENROUTER_MODEL` | A model ID copied from https://openrouter.ai/models, for example `openai/gpt-oss-120b`. The grader asks the model for a structured result (score and feedback), so pick one that supports tool calling / structured outputs. Models ending in `:free` come and go: if grading fails with a 404 "model is unavailable", pick another model or use the paid version of the same one (it needs credit on your OpenRouter account). Restart the server after changing it. |
+| `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` | Create an account at https://cloudinary.com. All three are on the **Dashboard** (Product Environment Credentials). Course materials and student submissions are uploaded as **private** files: they cannot be opened from a Cloudinary link, only downloaded through this API by people allowed to see them. |
 
 A copy of this template is in `.env.example`: copy it to `.env` and fill in the values.
 
@@ -137,6 +139,7 @@ You do **not** need these locally. They matter when you deploy (see [Deploying t
 
 | Variable | Default | What it does |
 | --- | --- | --- |
+| `OPENROUTER_VISION_MODEL` | empty | A model that can **read images**, used for photos of handwritten work and scanned PDFs. Copy its ID from https://openrouter.ai/models (filter **Input Modalities: Image**) and pick one that also supports tool calling. Leave it empty and AI grading still works for typed answers, code, PDFs with a text layer, Word files and ZIP projects; image and scanned submissions are then listed as "needs a vision model" so the teacher grades them by hand. It can be the same model as `OPENROUTER_MODEL` if that model accepts images. Restart the server after changing it. |
 | `ENVIRONMENT` | `development` | `production` switches to PostgreSQL (`DB_URL`), hides `/docs` and makes cookies `Secure`. **Never set it in your local `.env`.** |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | `7` | How long a student stays logged in without typing their password again. |
 | `ALLOWED_ORIGINS` | empty | Deployed frontend address(es), comma-separated. Needed for CORS and the CSRF check. Localhost addresses are always allowed. |
@@ -223,6 +226,7 @@ ADMIN_PASSWORD=a-strong-password
 ADMIN_FULLNAME=System Administrator
 OPENROUTER_API_KEY=your-openrouter-key
 OPENROUTER_MODEL=openai/gpt-oss-120b
+# OPENROUTER_VISION_MODEL=   (optional, see "Optional variables")
 CLOUDINARY_CLOUD_NAME=your-cloud-name
 CLOUDINARY_API_KEY=your-api-key
 CLOUDINARY_API_SECRET=your-api-secret
@@ -245,6 +249,8 @@ What each part does:
 | `--port $PORT` | Railway, Render and Heroku give you the port in a variable called `PORT`. On a VPS, use a fixed number such as `--port 8000` instead. |
 | `--workers 2` | Two server processes. Password checking (bcrypt) is slow and uses one CPU core per process, so this roughly doubles how many students can log in at once. Use one worker per CPU core, up to about 4. |
 | `--proxy-headers --forwarded-allow-ips="*"` | Behind the host's proxy, every request looks like it comes from the proxy. These flags make the app see each student's real IP, so rate limiting works per person. |
+
+> **Batch AI grading and `--workers`:** the progress of a batch AI grading run, and the lock that stops two runs on the same assignment, are kept in the memory of one server process. With `--workers 2`, a progress check can reach the other process, which knows nothing about the run: the progress bar can vanish, and a second click can start a duplicate run (wasted AI cost). Grades that were saved stay saved either way. Until this is moved into the database, use `--workers 1` if teachers will use batch AI grading.
 
 Do **not** use `--reload` in production.
 
@@ -276,6 +282,7 @@ alembic revision -m "describe the change"   # then edit the new file in alembic/
 alembic upgrade head                        # apply it
 ```
 
+- One exception: the `assignments.grading_criteria` column (the saved AI grading criteria) is added automatically at startup by `_ensure_columns()` in `app/database.py` if it is missing, so old databases keep working without a migration. Use Alembic for every new change.
 - Locally, `alembic upgrade head` updates your `database.db`. Run it once after pulling these changes if you already have a `database.db`. You can skip it by deleting `database.db` and letting the app create a fresh one.
 - In production it already runs on every start (Step 3).
 - Alembic reads the database from the same place as the app (`ENVIRONMENT` and `DB_URL`), so you never configure a URL for it.
@@ -313,6 +320,10 @@ alembic upgrade head                        # apply it
 | `NoSuchModuleError: Can't load plugin: sqlalchemy.dialects:postgres` | The URL starts with `postgres://` and is not being converted. Make sure `ENVIRONMENT=production` is set, because only then does `database.py` use `_normalize_db_url(CONFIG.DB_URL)`. |
 | `server closed the connection unexpectedly` on PostgreSQL | The host dropped an idle connection. `pool_pre_ping` and `pool_recycle` in `database.py` prevent this. Make sure they were not removed. |
 | `character varying = uuid` or other SQL type errors on PostgreSQL | An ID from the URL was compared to the database without converting it to text. Declare route ID parameters as `str`, or wrap them in `str(...)`. |
+| AI grading says "AI grading is not set up correctly on the server" | `OPENROUTER_MODEL` (or `OPENROUTER_VISION_MODEL`) is not a valid model ID. Copy it from https://openrouter.ai/models in the form `provider/model-name`, then restart. |
+| AI grading says "The AI service failed to grade this submission" | Read the server log for OpenRouter's reason. Usual causes: the model name does not exist or is unavailable (404), the OpenRouter account has no credit, or the model does not support tool calling. A name with the right format but that does not exist only fails when the first submission is graded. |
+| AI grading says "This is an image / a scanned PDF, which needs a vision model" | Set `OPENROUTER_VISION_MODEL` to a model that accepts images and restart, or grade that submission by hand. |
+| AI grading says a batch run is already in progress | Wait for the progress bar on the grading page to finish. If the server restarted mid-run, the submissions it had not reached are still ungraded: start the run again. |
 | Port already in use | Another copy is running. Stop it with Ctrl + C, or use a different port: `uvicorn app.main:app --reload --port 8001` (then update `BASE_URL` in the frontend). |
 
 ---
@@ -329,8 +340,12 @@ University Connect/
 │   ├── schemas.py           request/response shapes
 │   ├── oauth2.py            login cookies, access/refresh tokens, role checks
 │   ├── routes/              API endpoints (admin, auth, courses, ...)
-│   ├── services/            AI grading
-│   └── utils/               helpers (admin setup, hashing, uploads, rate limit, HTML sanitizing)
+│   ├── services/
+│   │   ├── ai_grading_service.py   talks to the AI models (prompt, text and vision calls)
+│   │   └── grading_runner.py       reads a submission's file, grades it, saves the grade, runs batch jobs
+│   └── utils/               helpers: admin setup, hashing, rate limit, HTML sanitizing,
+│                            cloud_storage (private Cloudinary files), file_validation (upload checks),
+│                            file_extraction (text from code, PDF, DOCX, ZIP for the AI grader)
 ├── alembic/                 database migrations (run: alembic upgrade head)
 ├── alembic.ini
 ├── .env                     your secrets (not committed)

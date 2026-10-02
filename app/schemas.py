@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field, ConfigDict, field_validator
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime
 from uuid import UUID
 from .models import (UserRole, SubmissionStatus, AnnouncementType, Department, 
@@ -199,7 +199,7 @@ class AssignmentBase(BaseModel):
     description: Optional[str] = None
     max_score: float = 100.0
     due_date: Optional[datetime] = None
-    # grading_criteria: Optional[str] = None
+    grading_criteria: Optional[str] = None
 
 class AssignmentCreate(AssignmentBase):
     course_id: UUID
@@ -209,6 +209,7 @@ class AssignmentUpdate(BaseModel):
     description: Optional[str] = None
     max_score: Optional[float] = None
     due_date: Optional[datetime] = None
+    grading_criteria: Optional[str] = None
     is_active: Optional[bool] = None
 
 class AssignmentResponse(AssignmentBase):
@@ -252,7 +253,11 @@ class SubmissionManualGrade(BaseModel):
     })
 
 class SubmissionAIGradeRequest(BaseModel):
+    # Leave criteria empty to use the ones saved on the assignment.
     criteria: Optional[str] = None
+    # Batch only: which ungraded submissions to include.
+    #   all   = everything   text = typed answer, no file   files = has an attached file
+    scope: Literal["all", "text", "files"] = "all"
     
     model_config = ConfigDict(json_schema_extra={
         "example": {

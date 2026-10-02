@@ -1,14 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
 from typing import List
 from uuid import UUID
-from datetime import datetime, timezone
-from ..database import get_db
-from ..models import Assignment, Course, User, Enrollment, Submission, UserRole, NotificationType
-from ..schemas import AssignmentCreate, AssignmentResponse, AssignmentUpdate, SubmissionAIGradeRequest, SubmissionStatus
-from ..oauth2 import get_current_user, get_current_teacher, get_current_student
-from ..services.ai_grading_service import AIGradingService
+
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from ..database import get_db
+from ..models import Assignment, Course, Enrollment, NotificationType, Submission, SubmissionStatus, User, UserRole
+from ..oauth2 import get_current_student, get_current_teacher, get_current_user
+from ..schemas import AssignmentCreate, AssignmentResponse, AssignmentUpdate, SubmissionAIGradeRequest
+from ..services.grading_runner import GradingError, get_job, start_job, submission_kind
 from .Notifications import fan_out, get_enrolled_student_ids
 
 router = APIRouter(prefix="/assignments", tags=["Assignments"])
@@ -33,7 +34,8 @@ def create_assignment(
         title=assignment_data.title,
         description=assignment_data.description,
         max_score=assignment_data.max_score,
-        due_date=assignment_data.due_date
+        due_date=assignment_data.due_date,
+        grading_criteria=assignment_data.grading_criteria,
     )
     db.add(new_assignment)
     db.flush()  # gets new_assignment.id without committing
@@ -55,84 +57,68 @@ def create_assignment(
     return new_assignment
 
 
-@router.post("/{assignment_id}/grade/ai-batch")
+def _get_own_assignment(db: Session, assignment_id: UUID, teacher: User) -> Assignment:
+    assignment = db.query(Assignment).filter(Assignment.id == str(assignment_id)).first()
+    if not assignment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assignment not found")
+    if assignment.course.teacher_id != teacher.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only grade submissions for your own courses")
+    return assignment
+
+
+@router.post("/{assignment_id}/grade/ai-batch", status_code=status.HTTP_202_ACCEPTED)
 async def batch_grade_with_ai(
     assignment_id: UUID,
     grade_request: SubmissionAIGradeRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_teacher)
 ):
-    """Batch AI grading for all ungraded submissions in an assignment"""
-    assignment = db.query(Assignment).filter(Assignment.id == str(assignment_id)).first()
-    if not assignment:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assignment not found")
+    """
+    Start AI grading of every ungraded submission in the chosen scope. Returns at
+    once; poll GET /assignments/{id}/grade/ai-batch/status for progress.
+    """
+    assignment = _get_own_assignment(db, assignment_id, current_user)
 
-    if assignment.course.teacher_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only grade submissions for your own courses")
-
-    submissions = db.query(Submission).filter(
-        Submission.assignment_id == str(assignment_id),
-        Submission.status != SubmissionStatus.GRADED,
-        Submission.content.isnot(None)
-    ).all()
-
-    if not submissions:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No ungraded text submissions found for this assignment")
-
-    criteria = grade_request.criteria
+    criteria = (grade_request.criteria or assignment.grading_criteria or "").strip()
     if not criteria:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please provide grading criteria")
 
-    try:
-        ai_service = AIGradingService()
-        graded_count = 0
-        failed_count = 0
+    ungraded = db.query(Submission).filter(
+        Submission.assignment_id == str(assignment_id),
+        Submission.status != SubmissionStatus.GRADED,
+    ).all()
 
-        for submission in submissions:
-            try:
-                grading_result = await ai_service.grade_submission(
-                    submission_content=submission.content,
-                    assignment_title=assignment.title,
-                    assignment_description=assignment.description or "",
-                    max_score=assignment.max_score,
-                    criteria=criteria
-                )
-                submission.score = grading_result.score
-                submission.feedback = grading_result.feedback
-                submission.status = SubmissionStatus.GRADED
-                submission.graded_at = datetime.now(timezone.utc)
+    wanted = [
+        s for s in ungraded
+        if (s.content or s.file_url)
+        and (grade_request.scope == "all" or submission_kind(s) == grade_request.scope)
+    ]
+    if not wanted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No ungraded submissions match this selection")
 
-                # ── TRIGGER 3 (batch): Notify each student their assignment was graded ──
-                fan_out(
-                    db,
-                    student_ids=[str(submission.student_id)],
-                    type=NotificationType.ASSIGNMENT_GRADED,
-                    title=f"Assignment graded — {assignment.course.course_code}",
-                    message=(
-                        f'Your submission for "{assignment.title}" has been graded. '
-                        f'You scored {grading_result.score}/{assignment.max_score}. Tap to view your feedback.'
-                    ),
-                    assignment_id=str(assignment.id),
-                    course_id=str(assignment.course_id),
-                )
-                graded_count += 1
-
-            except Exception as e:
-                failed_count += 1
-                print(f"Failed to grade submission {submission.id}: {str(e)}")
-                continue
-
+    # Remember the criteria so the teacher does not have to retype them.
+    if criteria != (assignment.grading_criteria or ""):
+        assignment.grading_criteria = criteria
         db.commit()
 
-        return {
-            "message": "Batch grading completed",
-            "total_submissions": len(submissions),
-            "graded_successfully": graded_count,
-            "failed": failed_count
-        }
+    try:
+        job = start_job(str(assignment.id), [s.id for s in wanted], criteria)
+    except GradingError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
 
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Batch AI grading failed: {str(e)}")
+    return job.as_dict()
+
+
+@router.get("/{assignment_id}/grade/ai-batch/status")
+def batch_grade_status(
+    assignment_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_teacher)
+):
+    """Progress of the latest AI batch grading run for this assignment."""
+    assignment = _get_own_assignment(db, assignment_id, current_user)
+    job = get_job(str(assignment.id))
+    return job.as_dict() if job else {"status": "idle"}
 
 
 # ── Static-segment routes (must come before /{assignment_id}) ─────────────────

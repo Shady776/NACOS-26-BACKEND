@@ -5,7 +5,6 @@ from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session, joinedload
 
 from ..database import get_db
@@ -27,16 +26,15 @@ from ..schemas import (
     SubmissionManualGrade,
     SubmissionResponse,
 )
-from ..services.ai_grading_service import AIGradingService
+from ..services.grading_runner import GradingError, apply_grade, get_job, grade_one, make_ai_service
 from ..utils.cloud_storage import (
     delete_stored_file,
-    fetch_stored_file_bytes,
     media_type_for_extension,
     stored_file_extension,
     stream_stored_file,
     upload_private_file,
 )
-from ..utils.file_extraction import ExtractionError, TEXT_EXTENSIONS, extract_gradable_text
+from ..utils.file_extraction import TEXT_EXTENSIONS
 from ..utils.file_validation import validate_upload_file
 from ..utils.sanitize import sanitize_html
 from .Notifications import fan_out
@@ -356,61 +354,32 @@ async def grade_submission_with_ai(
     if not submission:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Submission not found")
 
-    if submission.assignment.course.teacher_id != current_user.id:
+    assignment = submission.assignment
+    if assignment.course.teacher_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only grade submissions for your own courses")
 
-    if not submission.content and not submission.file_url:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This submission has no content or file to grade")
-
-    criteria = grade_request.criteria
+    # Criteria typed now win; otherwise use the ones saved on the assignment.
+    criteria = (grade_request.criteria or assignment.grading_criteria or "").strip()
     if not criteria:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please provide grading criteria for AI grading")
 
-    # The AI gets the typed answer and, if there is one, the text pulled out of
-    # the attached file (code, PDF, DOCX, or a ZIP project). A file that can't
-    # be read stops the grading, so it is never silently ignored.
-    gradable_text = submission.content or ""
-    if submission.file_url:
-        extension = stored_file_extension(submission.file_url)
-        filename = f"submission.{extension}" if extension else "submission"
-        try:
-            file_bytes = await run_in_threadpool(fetch_stored_file_bytes, submission.file_url)
-            file_text = await run_in_threadpool(extract_gradable_text, file_bytes, filename)
-        except ExtractionError as e:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-        except Exception:
-            logger.exception("Could not read the file of submission %s", submission.id)
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Could not retrieve the submitted file. Please try again.",
-            )
-        gradable_text = f"{gradable_text}\n\n--- Attached file ---\n{file_text}" if gradable_text else file_text
+    # Don't fight a batch run that is grading this same assignment right now.
+    job = get_job(str(assignment.id))
+    if job and job.status == "running":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A batch grading run is in progress for this assignment. Wait for it to finish.")
 
     try:
-        ai_service     = AIGradingService()
-        assignment     = submission.assignment
-        grading_result = await ai_service.grade_submission(
-            submission_content=gradable_text,
-            assignment_title=assignment.title,
-            assignment_description=assignment.description or "",
-            max_score=assignment.max_score,
-            criteria=criteria
-        )
+        # Reads the typed answer and the attached file (code, PDF, DOCX, ZIP, image or scan).
+        result = await grade_one(make_ai_service(), submission, assignment, criteria)
+    except GradingError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
 
-        submission.score     = grading_result.score
-        submission.feedback  = grading_result.feedback
-        submission.status    = SubmissionStatus.GRADED
-        submission.graded_at = datetime.now(timezone.utc)
-
-        # ── TRIGGER 3 (AI single): Notify student ────────────────────────────
-        _notify_graded(db, submission)
-
-        db.commit()
-        db.refresh(submission)
-        return submission
-
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"AI grading failed: {str(e)}")
+    apply_grade(db, submission, assignment, result)
+    if criteria != (assignment.grading_criteria or ""):
+        assignment.grading_criteria = criteria
+    db.commit()
+    db.refresh(submission)
+    return submission
 
 
 @router.post("/{submission_id}/grade/manual", response_model=SubmissionResponse)
