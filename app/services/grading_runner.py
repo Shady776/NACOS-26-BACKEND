@@ -11,7 +11,7 @@ from ..database import SessionLocal
 from ..models import Assignment, NotificationType, Submission, SubmissionStatus
 from ..routes.Notifications import fan_out
 from ..utils.cloud_storage import fetch_stored_file_bytes, stored_file_extension
-from ..utils.file_extraction import ExtractionError, extract_gradable_text
+from ..utils.file_extraction import ExtractionError, NoTextLayerError, extract_gradable_text
 from .ai_grading_service import AIGradingService
 
 logger = logging.getLogger(__name__)
@@ -81,9 +81,13 @@ async def grade_one(
         else:
             filename = f"submission.{extension}" if extension else "submission"
             try:
-                file_text = await run_in_threadpool(extract_gradable_text, file_bytes, filename)
-            except ExtractionError:
-                vision_reason = "a scanned PDF"  # the vision model can still read it
+                file_text = await run_in_threadpool(
+                    extract_gradable_text,
+                    file_bytes,
+                    filename,
+                )
+            except NoTextLayerError:
+                vision_reason = "a scanned PDF"
             except ExtractionError as e:
                 raise GradingError(str(e))
 

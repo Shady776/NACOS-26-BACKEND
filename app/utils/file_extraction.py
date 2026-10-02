@@ -44,7 +44,11 @@ ZIP_SKIP_DIR_PARTS = {
 
 
 class ExtractionError(Exception):
-    """Raised when no usable text could be pulled from the file."""
+    """Raised when file extraction fails."""
+
+
+class NoTextLayerError(ExtractionError):
+    """Raised when a PDF has no extractable text layer."""
 
 
 def _get_extension(filename: str) -> str:
@@ -88,7 +92,10 @@ def _extract_pdf(content: bytes) -> str:
         raise ExtractionError(f"Could not read this PDF — it may be corrupted ({e})")
     text = "\n\n".join(pages).strip()
     if not text:
-        raise ExtractionError("Could not extract any text from this PDF (it may be a scanned image with no OCR text layer)")
+        raise NoTextLayerError(
+            "Could not extract any text from this PDF "
+            "(it may be a scanned image with no OCR text layer)"
+    )
     return text
 
 
